@@ -6,7 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-
+import torch.nn.functional as F
 __all__ = (
     "Conv",
     "Conv2",
@@ -21,6 +21,9 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
+    "SqEx",
+    "ResBlockSqEx",
+    "GAM_Attention",
 )
 
 
@@ -331,3 +334,117 @@ class Concat(nn.Module):
     def forward(self, x):
         """Forward pass for the YOLOv8 mask Proto module."""
         return torch.cat(x, self.d)
+# Squeeze and Excitation module v2
+class SqEx(nn.Module):
+
+    def __init__(self, channels, r=16):
+        super(SqEx, self).__init__()
+
+        self.bottleneck_features = channels // r
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(output_size=1)
+        self.fc1 = nn.Linear(in_features=channels, out_features=self.bottleneck_features)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(in_features=self.bottleneck_features, out_features=channels)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        conv = x
+
+        x = self.avg_pool.forward(x)
+        x = x.squeeze(dim=3)
+        x = x.squeeze(dim=2)
+        x = self.fc1.forward(x)
+        x = self.relu.forward(x)
+        x = self.fc2.forward(x)
+        x = self.sigmoid.forward(x)
+        x = x.unsqueeze(dim=2)
+        x = x.unsqueeze(dim=3)
+
+        conv = conv * x
+
+        return conv
+
+
+# Residual block using Squeeze and Excitation
+
+class ResBlockSqEx(nn.Module):
+
+    def __init__(self, n_features):
+        super(ResBlockSqEx, self).__init__()
+
+        # convolutions
+
+        self.norm1 = nn.BatchNorm2d(n_features)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.conv1 = nn.Conv2d(n_features, n_features, kernel_size=3, stride=1, padding=1, bias=False)
+
+        self.norm2 = nn.BatchNorm2d(n_features)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(n_features, n_features, kernel_size=3, stride=1, padding=1, bias=False)
+
+        # squeeze and excitation
+
+        self.sqex = SqEx(n_features)
+
+    def forward(self, x):
+        # convolutions
+
+        y = self.conv1(self.relu1(self.norm1(x)))
+        y = self.conv2(self.relu2(self.norm2(y)))
+
+        # squeeze and excitation
+
+        y = self.sqex(y)
+
+        # add residuals
+
+        y = torch.add(x, y)
+
+        return y
+
+def channel_shuffle(x, groups=2):  # shuffle channel
+    # RESHAPE----->transpose------->Flatten
+    B, C, H, W = x.size()
+    out = x.view(B, groups, C // groups, H, W).permute(0, 2, 1, 3, 4).contiguous()
+    out = out.view(B, C, H, W)
+    return out
+
+class GAM_Attention(nn.Module):
+    def __init__(self, c1, c2, group=True, rate=4):
+        super(GAM_Attention, self).__init__()
+
+        self.channel_attention = nn.Sequential(
+            nn.Linear(c1, int(c1 / rate)),
+            nn.ReLU(inplace=True),
+            nn.Linear(int(c1 / rate), c1)
+        )
+
+        self.spatial_attention = nn.Sequential(
+
+            nn.Conv2d(c1, c1 // rate, kernel_size=7, padding=3, groups=rate) if group else nn.Conv2d(c1,
+                                                                                                         int(c1 / rate),
+                                                                                                         kernel_size=7,
+                                                                                                         padding=3),
+            nn.BatchNorm2d(int(c1 / rate)),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1 // rate, c2, kernel_size=7, padding=3, groups=rate) if group else nn.Conv2d(int(c1 / rate),
+                                                                                                         c2,
+                                                                                                         kernel_size=7,
+                                                                                                         padding=3),
+            nn.BatchNorm2d(c2)
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)
+        x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)
+        x_channel_att = x_att_permute.permute(0, 3, 1, 2)
+        # x_channel_att=channel_shuffle(x_channel_att,4) #last shuffle
+        x = x * x_channel_att
+
+        x_spatial_att = self.spatial_attention(x).sigmoid()
+        x_spatial_att = channel_shuffle(x_spatial_att, 4)  # last shuffle
+        out = x * x_spatial_att
+        # out=channel_shuffle(out,4) #last shuffle
+        return out

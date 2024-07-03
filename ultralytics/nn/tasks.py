@@ -77,7 +77,9 @@ from ultralytics.utils.torch_utils import (
     scale_img,
     time_sync,
 )
-
+from ultralytics.nn.modules.conv import ResBlockSqEx
+from ultralytics.nn.modules.conv import SqEx
+from ultralytics.nn.modules.conv import GAM_Attention
 try:
     import thop
 except ImportError:
@@ -979,6 +981,23 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             args = [c1, c2, *args[1:]]
         elif m is CBFuse:
             c2 = ch[f[-1]]
+        elif m in {ResBlockSqEx}:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, *args[1:]]
+        elif m in {SqEx}:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            # args = [c1, *args[1:]]
+            args = [c1, c2, *args[1:]]
+        elif m in {GAM_Attention}:
+            c1, c2 = ch[f], args[0]
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            # args = [c1, *args[1:]]
+            args = [c1, c2, *args[1:]]
         else:
             c2 = ch[f]
 
